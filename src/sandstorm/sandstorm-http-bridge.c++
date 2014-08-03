@@ -1029,11 +1029,63 @@ class LocalStorageWebSessionImpl final: public WebSession::Server {
 public:
   LocalStorageWebSessionImpl(kj::NetworkAddress& serverAddr,
                              UserInfo::Reader userInfo, SessionContext::Client context,
-                             WebSession::Params::Reader params, kj::String&& permissions) :
-    inner(serverAddr, userInfo, context, params, kj::mv(permissions))
-    {}
+                             WebSession::Params::Reader params, kj::String&& permissions)
+    : inner(serverAddr, userInfo, context, params, kj::mv(permissions)) {
+    if (userInfo.hasUserId()) {
+      auto id = userInfo.getUserId();
+      KJ_ASSERT(id.size() == 32, "User ID not a SHA-256?");
+
+      // We truncate to 128 bits to be a little more wieldy. Still 32 chars, though.
+      userId = hexEncode(userInfo.getUserId().slice(0, 16));
+    }
+  }
+
+  kj::Promise<void> get(GetContext context) override {
+    auto params = context.getParams();
+    auto path = params.getPath();
+    if (path == "/.sandstorm-monkeypatch.js") {
+      return inner.get(context);
+    } else {
+      return inner.get(context);
+    }
+  }
+
+  kj::Promise<void> post(PostContext context) override {
+    return inner.post(context);
+  }
+
+  kj::Promise<void> put(PutContext context) override {
+    KJ_LOG(ERROR, "got a PUT");
+    auto params = context.getParams();
+    auto path = params.getPath();
+    KJ_LOG(ERROR, kj::str("at: ", path));
+    if (path.startsWith(".sandstorm-localstorage/")) {
+      auto results = context.getResults();
+      KJ_LOG(ERROR, "got a localstorage PUT");
+      KJ_IF_MAYBE(pos, path.findFirst('/')) {
+        kj::StringPtr key = path.slice(*pos + 1);
+        KJ_LOG(ERROR, kj::str("key = ", key));
+        results.initNoContent();
+        return kj::READY_NOW;
+      }
+      results.initClientError();
+      return kj::READY_NOW;
+    } else {
+      return inner.put(context);
+    }
+  }
+
+  kj::Promise<void> delete_(DeleteContext context) override {
+    return inner.delete_(context);
+  }
+
+  kj::Promise<void> openWebSocket(OpenWebSocketContext context) override {
+    return inner.openWebSocket(context);
+  }
+
 private:
   WebSessionImpl inner;
+  kj::Maybe<kj::String> userId;
 };
 
 class EmailSessionImpl final: public HackEmailSession::Server {
@@ -1248,9 +1300,22 @@ public:
       }
       auto permissions = kj::strArray(permissionVec, ",");
 
-      context.getResults(capnp::MessageSize {2, 1}).setSession(
-          kj::heap<WebSessionImpl>(serverAddress, params.getUserInfo(), params.getContext(),
-                                   params.getSessionParams().getAs<WebSession::Params>(), kj::mv(permissions)));
+      switch (config.getLocalStorageSync().which()) {
+      case spk::BridgeConfig::LocalStorageSync::NONE :
+        KJ_LOG(ERROR, "NONE");
+          context.getResults(capnp::MessageSize {2, 1}).setSession(
+             kj::heap<WebSessionImpl>(serverAddress, params.getUserInfo(), params.getContext(),
+                                      params.getSessionParams().getAs<WebSession::Params>(), kj::mv(permissions)));
+          break;
+      case spk::BridgeConfig::LocalStorageSync::PER_GRAIN_USER :
+        KJ_LOG(ERROR, "PER GRAIN USER");
+          context.getResults(capnp::MessageSize {2, 1}).setSession(
+             kj::heap<LocalStorageWebSessionImpl>(serverAddress, params.getUserInfo(), params.getContext(),
+                                      params.getSessionParams().getAs<WebSession::Params>(), kj::mv(permissions)));
+          break;
+
+      }
+
     } else if (params.getSessionType() == capnp::typeId<HackEmailSession>()) {
       context.getResults(capnp::MessageSize {2, 1}).setSession(kj::heap<EmailSessionImpl>());
     }
