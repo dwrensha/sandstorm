@@ -947,7 +947,6 @@ private:
   kj::String basePath;
   kj::String userAgent;
   kj::String acceptLanguages;
-  spk::BridgeConfig::Reader config;
 
   kj::String makeHeaders(kj::StringPtr method, kj::StringPtr path,
                          WebSession::Context::Reader context,
@@ -1024,6 +1023,17 @@ private:
       parser.build(context.getResults());
     });
   }
+};
+
+class LocalStorageWebSessionImpl final: public WebSession::Server {
+public:
+  LocalStorageWebSessionImpl(kj::NetworkAddress& serverAddr,
+                             UserInfo::Reader userInfo, SessionContext::Client context,
+                             WebSession::Params::Reader params, kj::String&& permissions) :
+    inner(serverAddr, userInfo, context, params, kj::mv(permissions))
+    {}
+private:
+  WebSessionImpl inner;
 };
 
 class EmailSessionImpl final: public HackEmailSession::Server {

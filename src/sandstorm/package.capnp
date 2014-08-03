@@ -185,6 +185,11 @@ struct BridgeConfig {
   # When a request comes in from the user, sandstorm-http-bridge will set the
   # X-Sandstorm-Permissions header to a comma-delimited list of permission names corresponding to
   # the user's permissions.
+
+  localStorageSync : union {
+    none @1 : Void;
+    perGrainUser @2 : Void;
+  }
 }
 
 # ==============================================================================
