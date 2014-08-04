@@ -43,6 +43,8 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
+
 #include <fcntl.h>
 #include <stdio.h>
 
@@ -1029,15 +1031,20 @@ class LocalStorageWebSessionImpl final: public WebSession::Server {
 public:
   LocalStorageWebSessionImpl(kj::NetworkAddress& serverAddr,
                              UserInfo::Reader userInfo, SessionContext::Client context,
-                             WebSession::Params::Reader params, kj::String&& permissions)
-    : inner(serverAddr, userInfo, context, params, kj::mv(permissions)) {
+                             WebSession::Params::Reader params, kj::String&& permissions,
+                             kj::AsyncIoContext& ioContext)
+    : ioContext(ioContext), inner(serverAddr, userInfo, context, params, kj::mv(permissions)) {
     if (userInfo.hasUserId()) {
       auto id = userInfo.getUserId();
       KJ_ASSERT(id.size() == 32, "User ID not a SHA-256?");
 
       // We truncate to 128 bits to be a little more wieldy. Still 32 chars, though.
-      userId = hexEncode(userInfo.getUserId().slice(0, 16));
+      maybeUserId = hexEncode(userInfo.getUserId().slice(0, 16));
+    } else {
+      KJ_LOG(ERROR, "WHAT");
     }
+
+    ensureExists(STORAGE_DIRECTORY, true);
   }
 
   kj::Promise<void> get(GetContext context) override {
@@ -1064,7 +1071,17 @@ public:
       KJ_LOG(ERROR, "got a localstorage PUT");
       KJ_IF_MAYBE(pos, path.findFirst('/')) {
         kj::StringPtr key = path.slice(*pos + 1);
-        KJ_LOG(ERROR, kj::str("key = ", key));
+        KJ_LOG(ERROR, key);
+        KJ_IF_MAYBE(userId, maybeUserId) {
+          ensureExists(kj::str(STORAGE_DIRECTORY, "/", *userId), true);
+          KJ_LOG(ERROR, *userId);
+          kj::FdOutputStream stream(raiiOpen(kj::str(STORAGE_DIRECTORY, "/", *userId, "/", key),
+                                             O_WRONLY | O_CREAT | O_TRUNC));
+          auto content = params.getContent().getContent();
+          stream.write(content.begin(), content.size());
+        }
+
+
         results.initNoContent();
         return kj::READY_NOW;
       }
@@ -1084,8 +1101,30 @@ public:
   }
 
 private:
+
+  void ensureExists(kj::StringPtr path, bool asDirectory) {
+    if (access(path.cStr(), F_OK) == 0) {
+      return;
+    }
+
+    KJ_IF_MAYBE(slashPos, path.findFirst('/')) {
+      if (*slashPos > 0) {
+        ensureExists(kj::heapString(path.slice(0, *slashPos)), true);
+      }
+    }
+
+    if (asDirectory) {
+      KJ_SYSCALL(mkdir(path.cStr(), 0777));
+    } else {
+      KJ_SYSCALL(mknod(path.cStr(), S_IFREG | 0777, 0));
+    }
+  }
+
+  const kj::StringPtr STORAGE_DIRECTORY = "/var/sandstorm-localstorage";
+
+  kj::AsyncIoContext& ioContext;
   WebSessionImpl inner;
-  kj::Maybe<kj::String> userId;
+  kj::Maybe<kj::String> maybeUserId;
 };
 
 class EmailSessionImpl final: public HackEmailSession::Server {
@@ -1273,8 +1312,9 @@ class UiViewImpl final: public UiView::Server {
 public:
   explicit UiViewImpl(kj::NetworkAddress& serverAddress,
                       RedirectableCapability& contextCap,
-                      spk::BridgeConfig::Reader config)
-      : serverAddress(serverAddress), contextCap(contextCap), config(config) {}
+                      spk::BridgeConfig::Reader config,
+                      kj::AsyncIoContext& ioContext)
+    : ioContext(ioContext), serverAddress(serverAddress), contextCap(contextCap), config(config) {}
 
   kj::Promise<void> getViewInfo(GetViewInfoContext context) override {
     context.setResults(config.getViewInfo());
@@ -1311,7 +1351,9 @@ public:
         KJ_LOG(ERROR, "PER GRAIN USER");
           context.getResults(capnp::MessageSize {2, 1}).setSession(
              kj::heap<LocalStorageWebSessionImpl>(serverAddress, params.getUserInfo(), params.getContext(),
-                                      params.getSessionParams().getAs<WebSession::Params>(), kj::mv(permissions)));
+                                                  params.getSessionParams().getAs<WebSession::Params>(),
+                                                  kj::mv(permissions),
+                                                  ioContext));
           break;
 
       }
@@ -1326,6 +1368,7 @@ public:
   }
 
 private:
+  kj::AsyncIoContext& ioContext;
   kj::NetworkAddress& serverAddress;
   RedirectableCapability& contextCap;
   spk::BridgeConfig::Reader config;
@@ -1522,7 +1565,7 @@ public:
       // Set up the Supervisor API socket.
       auto stream = ioContext.lowLevelProvider->wrapSocketFd(3);
       capnp::TwoPartyVatNetwork network(*stream, capnp::rpc::twoparty::Side::CLIENT);
-      Restorer restorer(kj::heap<UiViewImpl>(*address, hackContext, config));
+      Restorer restorer(kj::heap<UiViewImpl>(*address, hackContext, config, ioContext));
       auto rpcSystem = capnp::makeRpcServer(network, restorer);
 
       // Get the SandstormApi by restoring a null SturdyRef.
