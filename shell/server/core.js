@@ -135,7 +135,7 @@ function restoreInternal(sturdyRef, ownerPattern) {
   var hashedSturdyRef = hashSturdyRef(sturdyRef);
   var token = ApiTokens.findOne(hashedSturdyRef);
   if (!token) {
-    throw new Error("No token found to restore");
+    throw new Meteor.Error(404, "No token found to restore");
   }
   check(token.owner, ownerPattern);
 
@@ -144,14 +144,14 @@ function restoreInternal(sturdyRef, ownerPattern) {
       var notificationId = token.frontendRef.notificationHandle;
       return {cap: makeNotificationHandle(notificationId, true)};
     } else {
-      throw new Error("Unknown frontend token type.");
+      throw new Meteor.Error(403, "Unknown frontend token type.");
     }
   } else if (token.objectId) {
     return useGrain(token.grainId, function (supervisor) {
       return supervisor.restore(token.objectId);
     });
   } else {
-    throw new Error("Unknown token type.");
+    throw new Meteor.Error(403, "Unknown token type.");
   }
 }
 
@@ -182,16 +182,16 @@ function dropInternal (sturdyRef, ownerPattern) {
         dismissNotification(notificationId);
       }
     } else {
-      throw new Error("Unknown frontend token type.");
+      throw new Meteor.Error(403, "Unknown frontend token type.");
     }
   } else if (token.objectId) {
     if (token.objectId.wakeLockNotification) {
       dropWakelock(token.grainId, token.objectId.wakeLockNotification);
     } else {
-      throw new Error("Unknown objectId token type.");
+      throw new Meteor.Error(403, "Unknown objectId token type.");
     }
   } else {
-    throw new Error("Unknown token type.");
+    throw new Meteor.Error(403, "Unknown token type.");
   }
 }
 
