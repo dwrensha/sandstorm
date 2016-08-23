@@ -1056,7 +1056,8 @@ class BridgeContext: private kj::TaskSet::ErrorHandler {
 public:
   BridgeContext(SandstormApi<>::Client apiCap, spk::BridgeConfig::Reader config)
       : apiCap(kj::mv(apiCap)), config(config),
-        identitiesDir(openIdentitiesDir(config)), tasks(*this) {}
+        identitiesDir(openIdentitiesDir(config)),
+        trashDir(openTrashDir(config)), tasks(*this) {}
 
   void saveIdentity(capnp::Data::Reader identityId, Identity::Client identity) {
     if (!config.getSaveIdentityCaps()) return;
@@ -1083,6 +1084,9 @@ public:
           // allocating a block.
           KJ_SYSCALL(symlinkat(tokenText.cStr(), identitiesDir, textIdRef.cStr()));
 
+          // Clean up any existing ".failed" symlink.
+          dropFailedIdentity(textIdRef);
+
           // Make sure it's really saved.
           KJ_SYSCALL(fsync(identitiesDir));
         }));
@@ -1090,7 +1094,7 @@ public:
     }
   }
 
-  Identity::Client loadIdentity(kj::StringPtr origId) {
+  kj::Promise<Identity::Client> loadIdentity(kj::StringPtr origId) {
     // Obtain the identity capability for the given identity ID.
 
     KJ_REQUIRE(config.getSaveIdentityCaps(),
@@ -1103,14 +1107,13 @@ public:
     auto iter = liveIdentities.find(textId);
     if (iter == liveIdentities.end()) {
       // Not in the map. Load from disk.
-      Identity::Client identity = loadIdentityFromDisk(textId);
+      return loadIdentityFromDisk(origId).then([this, origId](auto identity) {
+        // Add to map.
+        KJ_ASSERT(liveIdentities.insert(std::make_pair(
+            origId, IdentityRecord { kj::heapString(origId), kj::cp(identity) })) .second);
 
-      // Add to map.
-      kj::StringPtr textIdRef = textId;
-      KJ_ASSERT(liveIdentities.insert(std::make_pair(
-          textIdRef, IdentityRecord { kj::mv(textId), kj::cp(identity) })).second);
-
-      return identity;
+        return identity;
+      });
     } else {
       // Identity is in the map.
       Identity::Client identity = iter->second.identity;
@@ -1129,14 +1132,14 @@ public:
                                       -> kj::Promise<Identity::Client> {
         if (e2.getType() == kj::Exception::Type::DISCONNECTED) {
           // Disconnected. We'll need to reload from disk.
-          Identity::Client newIdentity = loadIdentityFromDisk(textId);
+          return loadIdentityFromDisk(textId).then([this, KJ_MVCAP(textId)](auto identity) {
+            // Save the new identity to the map so that we don't have to reload it again.
+            auto iter = liveIdentities.find(textId);
+            KJ_ASSERT(iter != liveIdentities.end());
+            iter->second.identity = identity;
 
-          // Save the new identity to the map so that we don't have to reload it again.
-          auto iter = liveIdentities.find(textId);
-          KJ_ASSERT(iter != liveIdentities.end());
-          iter->second.identity = newIdentity;
-
-          return newIdentity;
+            return identity;
+          });
         } else {
           // Some other error -- meaning we're NOT disconnected, so go ahead and use the cap.
           return kj::mv(identity);
@@ -1152,6 +1155,7 @@ private:
   SandstormApi<>::Client apiCap;
   spk::BridgeConfig::Reader config;
   kj::AutoCloseFd identitiesDir;
+  kj::AutoCloseFd trashDir;
 
   struct IdentityRecord {
     IdentityRecord(const IdentityRecord& other) = delete;
@@ -1178,7 +1182,19 @@ private:
                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   }
 
-  Identity::Client loadIdentityFromDisk(kj::StringPtr textId) {
+  static kj::AutoCloseFd openTrashDir(spk::BridgeConfig::Reader config) {
+    if (!config.getSaveIdentityCaps()) return kj::AutoCloseFd();
+
+    recursivelyCreateParent("/var/.sandstorm-http-bridge/trash/foo");
+
+    // Note: Using O_PATH here would prevent fsync().
+    return raiiOpen("/var/.sandstorm-http-bridge/trash",
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  }
+
+  kj::Promise<Identity::Client> loadIdentityFromDisk(kj::StringPtr textId) {
+    // Note: caller must keep `textId` alive until the returned promise resolves.
+
     KJ_ASSERT(textId.size() == 32, "invalid identity ID", textId);
     for (char c: textId) {
       if ((c < '0' || '9' < c) && (c < 'a' && 'f' < c)) {
@@ -1188,14 +1204,69 @@ private:
 
     char buf[512];
     ssize_t n;
-    KJ_SYSCALL(n = readlinkat(identitiesDir, textId.cStr(), buf, sizeof(buf)));
+    bool expectSuccess = false;
+
+    if (faccessat(identitiesDir, textId.cStr(), F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+      expectSuccess = true;
+      KJ_SYSCALL(n = readlinkat(identitiesDir, textId.cStr(), buf, sizeof(buf)));
+    } else {
+      // If restoring ever fails, we tack a ".failed" suffix onto the symlink to signal
+      // that the identity should be re-saved next time an opportunity arises. This allows
+      // grains to automatically recover from a backup/restore cycle. If no re-saving
+      // opportunity has arisen yet, the best we can do is to retry on the sturdyref that
+      // previously failed.
+      KJ_SYSCALL(n = readlinkat(identitiesDir,
+          kj::str(textId, ".failed").cStr(), buf, sizeof(buf)));
+    }
+
     KJ_ASSERT(n < sizeof(buf), "token too long?");
     buf[n] = '\0';
 
     auto req = apiCap.restoreRequest();
     req.setToken(percentDecode(buf));
 
-    return req.send().getCap().castAs<Identity>();
+    return req.send().then([](auto response) {
+        return response.getCap().template castAs<Identity>();
+      }, [expectSuccess, textId, this](auto error) -> Identity::Client {
+        if (expectSuccess && error.getType() == kj::Exception::Type::FAILED) {
+          // First, clean up any existing ".failed" symlink.
+          dropFailedIdentity(textId);
+
+          // Rename the symlink so we remember that it failed to be restored.
+          KJ_SYSCALL(renameat(identitiesDir, textId.cStr(),
+                              identitiesDir, kj::str(textId, ".failed").cStr()));
+        }
+        throw error;
+        KJ_UNREACHABLE
+      });
+  }
+
+  void dropFailedIdentity(kj::StringPtr textId) {
+    auto failedFile = kj::str(textId, ".failed");
+
+    if (faccessat(identitiesDir, failedFile.cStr(), F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+      char buf[512];
+      ssize_t n;
+      KJ_SYSCALL(n = readlinkat(identitiesDir, failedFile.cStr(), buf, sizeof(buf)));
+      KJ_ASSERT(n < sizeof(buf), "token too long?");
+      buf[n] = '\0';
+
+      // We name the trash file after the token, not the identity ID. This way, it's okay
+      // if we overwrite an existing entry of the trash directory.
+      auto trashFile = kj::heapString(buf);
+      KJ_SYSCALL(renameat(identitiesDir, failedFile.cStr(), trashDir, trashFile.cStr()));
+
+      auto req = apiCap.dropRequest();
+      req.setToken(percentDecode(buf));
+      tasks.add(req.send().then([KJ_MVCAP(trashFile), this](auto response) -> void {
+        KJ_SYSCALL(unlinkat(trashDir, trashFile.cStr(), 0));
+        KJ_SYSCALL(fsync(trashDir));
+      }));
+
+      // TODO(someday): Implement some kind of garbage collection that clears out the trash
+      // directory periodically, to handle the rare case when the above drop() task fails to
+      // run to completion.
+    }
   }
 };
 
@@ -1888,9 +1959,10 @@ public:
   }
 
   kj::Promise<void> getSavedIdentity(GetSavedIdentityContext context) override {
-    context.getResults().setIdentity(
-        bridgeContext.loadIdentity(context.getParams().getIdentityId()));
-    return kj::READY_NOW;
+    auto identityId = context.getParams().getIdentityId();
+    return bridgeContext.loadIdentity(identityId).then([context] (auto identity) mutable -> void {
+      context.getResults().setIdentity(identity);
+    });
   }
 
 private:
